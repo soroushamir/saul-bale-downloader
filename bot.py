@@ -1,85 +1,37 @@
 import os
 import time
-import json
+import threading
+import queue
 import requests
-from datetime import datetime, timedelta
+import yt_dlp
 
-# ================== CONFIG ==================
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
-FASTSAVER_API_KEY = os.environ.get("FASTSAVER_API_KEY")
-
 BASE_URL = f"https://tapi.bale.ai/bot{BOT_TOKEN}"
-API_URL = "https://api.fastsaver.io/fetch"  # endpoint عمومی (نمونه)
 
 session = requests.Session()
 offset = None
 
-# ================== STORAGE ==================
-DATA_DIR = "data"
-os.makedirs(DATA_DIR, exist_ok=True)
-STATS_FILE = f"{DATA_DIR}/stats.json"
+download_queue = queue.Queue()
+user_links = {}
 
-def load_stats():
-    if not os.path.exists(STATS_FILE):
-        return {"total": 0, "mp3": 0, "youtube": 0, "instagram": 0, "tiktok": 0}
-    with open(STATS_FILE, "r") as f:
-        return json.load(f)
-
-def save_stats():
-    with open(STATS_FILE, "w") as f:
-        json.dump(stats, f)
-
-stats = load_stats()
-
-# ================== ANTI-SPAM ==================
-SPAM_LIMIT = 20  # seconds
-last_action = {}
-
-def is_spam(chat_id):
-    now = datetime.now()
-    last = last_action.get(chat_id)
-    if last and (now - last).seconds < SPAM_LIMIT:
-        return True
-    last_action[chat_id] = now
-    return False
-
-# ================== UI ==================
-INTRO = (
-    "😎 سلام! من *Better Call Saul Downloader* هستم\n\n"
-    "🎥 لینک YouTube / Instagram / TikTok بفرست\n"
-    "⚡ خیلی سریع با API کار می‌کنم\n"
-    "📉 مصرف حجم سرور کم\n\n"
-    "📞 Better Call Saul… Better Call Download!"
-)
-
-def progress_text(step):
-    steps = {
-        1: "🔍 در حال بررسی لینک…",
-        2: "🧠 در حال دریافت اطلاعات از سرور سریع…",
-        3: "🖼 آماده‌سازی پیش‌نمایش و کیفیت‌ها…",
-        4: "🎛 منتظر انتخاب کیفیت…",
-        5: "📦 آماده ارسال…",
-    }
-    return steps.get(step, "⏳ در حال پردازش…")
-
-# ================== BALE API ==================
-def get_updates(off=None):
+# ================= Bale API =================
+def get_updates(offset=None):
     params = {"timeout": 20}
-    if off:
-        params["offset"] = off
+    if offset:
+        params["offset"] = offset
     return session.get(f"{BASE_URL}/getUpdates", params=params).json()
 
-def send_message(chat_id, text):
-    r = session.post(
-        f"{BASE_URL}/sendMessage",
-        json={"chat_id": chat_id, "text": text},
-    ).json()
+def send_message(chat_id, text, reply_markup=None):
+    payload = {"chat_id": chat_id, "text": text}
+    if reply_markup:
+        payload["reply_markup"] = reply_markup
+    r = session.post(f"{BASE_URL}/sendMessage", json=payload).json()
     return r.get("result", {}).get("message_id")
 
 def edit_message(chat_id, message_id, text):
     session.post(
         f"{BASE_URL}/editMessageText",
-        json={"chat_id": chat_id, "message_id": message_id, "text": text},
+        json={"chat_id": chat_id, "message_id": message_id, "text": text}
     )
 
 def send_photo(chat_id, photo, caption, reply_markup):
@@ -89,177 +41,125 @@ def send_photo(chat_id, photo, caption, reply_markup):
             "chat_id": chat_id,
             "photo": photo,
             "caption": caption,
-            "reply_markup": reply_markup,
-        },
+            "reply_markup": reply_markup
+        }
     )
 
-def send_video_by_url(chat_id, video_url):
-    # بله اجازه می‌ده URL مستقیم بدی (مصرف باند سرور کمتر)
-    session.post(
-        f"{BASE_URL}/sendVideo",
-        json={"chat_id": chat_id, "video": video_url},
-    )
+def send_video(chat_id, path):
+    with open(path, "rb") as f:
+        session.post(
+            f"{BASE_URL}/sendVideo",
+            data={"chat_id": chat_id},
+            files={"video": f}
+        )
 
-def send_audio_by_url(chat_id, audio_url):
-    session.post(
-        f"{BASE_URL}/sendAudio",
-        json={"chat_id": chat_id, "audio": audio_url},
-    )
+# ================= Utils =================
+def progress_bar(p):
+    filled = int(p / 10)
+    return "█" * filled + "░" * (10 - filled)
 
-# ================== FASTSAVER API ==================
-def fetch_from_api(video_url):
-    params = {
-        "url": video_url,
-        "apikey": FASTSAVER_API_KEY,
-    }
-    r = session.get(API_URL, params=params, timeout=30)
-    r.raise_for_status()
-    return r.json()
+# ================= yt-dlp =================
+def extract_info(url):
+    with yt_dlp.YoutubeDL({"quiet": True}) as ydl:
+        return ydl.extract_info(url, download=False)
 
-def detect_platform(url):
-    if "youtube" in url or "youtu.be" in url:
-        return "youtube"
-    if "instagram" in url:
-        return "instagram"
-    if "tiktok" in url:
-        return "tiktok"
-    return "other"
+def get_qualities(info):
+    wanted = [360, 480, 720, 1080]
+    found = set()
+    for f in info.get("formats", []):
+        h = f.get("height")
+        if h in wanted:
+            found.add(h)
+    return sorted(found)
 
-# ================== CACHE (in-memory) ==================
-cache = {}
-# cache[chat_id] = api_response
+def download_worker():
+    while True:
+        job = download_queue.get()
+        if not job:
+            continue
 
-# ================== MAIN LOOP ==================
+        chat_id, url, quality = job
+        status_id = send_message(chat_id, "⬇️ شروع دانلود...")
+
+        def hook(d):
+            if d["status"] == "downloading":
+                total = d.get("total_bytes") or d.get("total_bytes_estimate")
+                if not total:
+                    return
+                percent = int(d.get("downloaded_bytes", 0) * 100 / total)
+                bar = progress_bar(percent)
+                edit_message(chat_id, status_id, f"{bar} {percent}%")
+
+            if d["status"] == "finished":
+                edit_message(chat_id, status_id, "📦 دانلود کامل شد، در حال ارسال...")
+
+        ydl_opts = {
+            "format": f"bestvideo[height<={quality}][vcodec!=vp9]+bestaudio/best",
+            "outtmpl": "video.mp4",
+            "merge_output_format": "mp4",
+            "quiet": True,
+            "progress_hooks": [hook],
+            "external_downloader": "aria2c",
+            "external_downloader_args": ["-x", "8", "-k", "1M"]
+        }
+
+        try:
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                ydl.download([url])
+
+            send_video(chat_id, "video.mp4")
+            os.remove("video.mp4")
+            send_message(chat_id, "✅ تموم شد 😎")
+
+        except Exception as e:
+            print("DOWNLOAD ERROR:", e)
+            send_message(chat_id, "❌ خطا در دانلود")
+
+        download_queue.task_done()
+
+# ================= Start Worker =================
+threading.Thread(target=download_worker, daemon=True).start()
+
+# ================= Main Loop =================
+send_message = send_message  # silence linter
+
 while True:
     updates = get_updates(offset)
 
     for upd in updates.get("result", []):
         offset = upd["update_id"] + 1
 
-        # -------- MESSAGE --------
         if "message" in upd and "text" in upd["message"]:
             chat_id = upd["message"]["chat"]["id"]
             text = upd["message"]["text"]
 
             if text == "/start":
-                send_message(chat_id, INTRO)
+                send_message(chat_id, "😎 Better Call Saul Downloader\nلینک بفرست!")
                 continue
 
-            if text == "/stats":
-                send_message(chat_id, json.dumps(stats, indent=2))
-                continue
+            if any(x in text for x in ["youtu", "insta", "tiktok"]):
+                send_message(chat_id, "🔍 بررسی لینک...")
+                info = extract_info(text)
+                qualities = get_qualities(info)
+                user_links[chat_id] = text
 
-            if is_spam(chat_id):
-                send_message(chat_id, "⏳ آروم‌تر موکل! یه لحظه صبر کن 😄")
-                continue
+                caption = f"🎬 {info.get('title')}\nکیفیت رو انتخاب کن 👇"
+                buttons = [[{"text": f"{q}p", "callback_data": str(q)}] for q in qualities]
 
-            if any(x in text for x in ["youtube.com", "youtu.be", "instagram.com", "tiktok.com"]):
-                status_id = send_message(chat_id, progress_text(1))
+                send_photo(
+                    chat_id,
+                    info.get("thumbnail"),
+                    caption,
+                    {"inline_keyboard": buttons}
+                )
 
-                try:
-                    edit_message(chat_id, status_id, progress_text(2))
-                    api_data = fetch_from_api(text)
-
-                    if not api_data.get("ok"):
-                        raise Exception("API error")
-
-                    edit_message(chat_id, status_id, progress_text(3))
-
-                    meta = api_data.get("meta", {})
-                    downloads = api_data.get("download", [])
-
-                    title = meta.get("title", "ویدیو")
-                    duration = meta.get("duration", 0)
-                    thumb = meta.get("thumbnail")
-
-                    mins, secs = divmod(int(duration), 60)
-                    platform = detect_platform(text)
-
-                    # آمار پلتفرم
-                    if platform in stats:
-                        stats[platform] += 1
-
-                    caption = (
-                        f"🎬 {title}\n"
-                        f"⏱ {mins:02}:{secs:02}\n"
-                        f"📺 منبع: {platform}\n\n"
-                        "کیفیت یا MP3 رو انتخاب کن 👇"
-                    )
-
-                    buttons = []
-                    row = []
-                    for item in downloads:
-                        if "quality" in item:
-                            row.append({
-                                "text": f"{item['quality']}p",
-                                "callback_data": f"q:{item['quality']}"
-                            })
-                        if len(row) == 2:
-                            buttons.append(row)
-                            row = []
-                    if row:
-                        buttons.append(row)
-
-                    # MP3
-                    if any("audio" in d for d in downloads):
-                        buttons.append([{
-                            "text": "🎵 MP3",
-                            "callback_data": "mp3"
-                        }])
-
-                    buttons.append([{
-                        "text": "❌ لغو",
-                        "callback_data": "cancel"
-                    }])
-
-                    cache[chat_id] = api_data
-
-                    edit_message(chat_id, status_id, progress_text(4))
-                    send_photo(
-                        chat_id,
-                        thumb,
-                        caption,
-                        {"inline_keyboard": buttons}
-                    )
-
-                except Exception as e:
-                    print("API ERROR:", e)
-                    edit_message(chat_id, status_id, "❌ خطا در پردازش لینک")
-
-        # -------- CALLBACK --------
         if "callback_query" in upd:
             cq = upd["callback_query"]
             chat_id = cq["message"]["chat"]["id"]
-            data = cq["data"]
+            quality = int(cq["data"])
+            url = user_links.get(chat_id)
 
-            api_data = cache.get(chat_id)
-            if not api_data:
-                continue
-
-            if data == "cancel":
-                send_message(chat_id, "❌ عملیات لغو شد")
-                cache.pop(chat_id, None)
-                continue
-
-            downloads = api_data.get("download", [])
-
-            if data == "mp3":
-                audio = next((d for d in downloads if "audio" in d), None)
-                if audio:
-                    send_message(chat_id, "🎵 در حال ارسال MP3…")
-                    send_audio_by_url(chat_id, audio["url"])
-                    stats["mp3"] += 1
-                    stats["total"] += 1
-                    save_stats()
-                continue
-
-            if data.startswith("q:"):
-                q = data.split(":")[1]
-                video = next((d for d in downloads if d.get("quality") == q), None)
-                if video:
-                    send_message(chat_id, f"📦 ارسال ویدیو {q}p…")
-                    send_video_by_url(chat_id, video["url"])
-                    stats["total"] += 1
-                    save_stats()
+            download_queue.put((chat_id, url, quality))
+            send_message(chat_id, "⏳ رفت تو صف دانلود...")
 
     time.sleep(1)
