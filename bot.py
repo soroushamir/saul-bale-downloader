@@ -103,8 +103,10 @@ while True:
                         saul_say("quality"),
                         reply_markup={"inline_keyboard": buttons}
                     )
-                except:
-                    send_message(chat_id, saul_say("error"))
+            except Exception as e:
+    print("ERROR:", e)
+    send_message(chat_id, saul_say("error"))
+
 
         # انتخاب کیفیت
         if "callback_query" in upd:
