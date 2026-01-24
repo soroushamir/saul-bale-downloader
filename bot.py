@@ -3,15 +3,24 @@ import time
 import requests
 import yt_dlp
 
+# ================== تنظیمات ==================
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 BASE_URL = f"https://tapi.bale.ai/bot{BOT_TOKEN}"
 
 session = requests.Session()
 offset = None
 
+# cache: chat_id -> info
 cache = {}
 
-# ------------------ Bale API ------------------
+INTRO_TEXT = (
+    "😎 سلام! من *Better Call Saul Bot* هستم\n\n"
+    "🎥 لینک ویدیو از YouTube / Instagram / TikTok بفرست\n"
+    "🎞 کیفیت رو انتخاب کن\n"
+    "📞 بقیه‌ش با ساوله!\n"
+)
+
+# ================== Bale API ==================
 def get_updates(offset=None):
     params = {"timeout": 20}
     if offset:
@@ -42,29 +51,33 @@ def send_video(chat_id, path):
             files={"video": v}
         )
 
-# ------------------ yt-dlp ------------------
+# ================== yt-dlp ==================
 def extract_info(url):
     with yt_dlp.YoutubeDL({"quiet": True}) as ydl:
         return ydl.extract_info(url, download=False)
 
-def available_qualities(info):
-    valid = [360, 480, 720, 1080]
+def get_qualities(info):
+    allowed = [360, 480, 720, 1080]
     found = set()
     for f in info.get("formats", []):
         h = f.get("height")
-        if h in valid:
+        if h in allowed:
             found.add(h)
-    return [q for q in valid if q in found]
+    return [q for q in allowed if q in found]
 
 def download_video(url, quality, chat_id):
+    last_step = -1
+
     def hook(d):
+        nonlocal last_step
         if d["status"] == "downloading":
             total = d.get("total_bytes") or d.get("total_bytes_estimate")
             if total:
                 percent = int(d.get("downloaded_bytes", 0) * 100 / total)
-                if percent in (10, 30, 50, 70, 90):
+                step = percent // 10
+                if step != last_step and step in (1, 3, 5, 7, 9):
+                    last_step = step
                     send_message(chat_id, f"⬇️ دانلود: {percent}%")
-
         if d["status"] == "finished":
             send_message(chat_id, "✅ دانلود کامل شد، در حال ارسال…")
 
@@ -81,36 +94,38 @@ def download_video(url, quality, chat_id):
 
     return "video.mp4"
 
-# ------------------ Main Loop ------------------
+# ================== Main Loop ==================
 while True:
     updates = get_updates(offset)
 
     for upd in updates.get("result", []):
         offset = upd["update_id"] + 1
 
-        # -------- Message --------
+        # ---------- Message ----------
         if "message" in upd and "text" in upd["message"]:
             chat_id = upd["message"]["chat"]["id"]
             text = upd["message"]["text"]
+
+            if text == "/start":
+                send_message(chat_id, INTRO_TEXT)
+                continue
 
             if any(x in text for x in ["youtube.com", "youtu.be", "instagram.com", "tiktok.com"]):
                 send_message(chat_id, "🔍 در حال بررسی لینک…")
 
                 try:
                     info = extract_info(text)
-                    qualities = available_qualities(info)
-
+                    qualities = get_qualities(info)
                     if not qualities:
                         raise Exception("No valid quality")
 
+                    duration = info.get("duration", 0)
+                    mins, secs = divmod(duration, 60)
+
                     cache[chat_id] = {
                         "url": text,
-                        "title": info.get("title", "ویدیو"),
-                        "duration": info.get("duration", 0)
+                        "title": info.get("title", "ویدیو")
                     }
-
-                    mins = cache[chat_id]["duration"] // 60
-                    secs = cache[chat_id]["duration"] % 60
 
                     caption = (
                         f"🎬 {cache[chat_id]['title']}\n"
@@ -134,20 +149,19 @@ while True:
                     print("ERROR:", e)
                     send_message(chat_id, "❌ خطا در پردازش لینک")
 
-        # -------- Callback --------
+        # ---------- Callback ----------
         if "callback_query" in upd:
             cq = upd["callback_query"]
             chat_id = cq["message"]["chat"]["id"]
             data = cq["data"]
 
             if data == "cancel":
-                send_message(chat_id, "❌ عملیات لغو شد")
                 cache.pop(chat_id, None)
+                send_message(chat_id, "❌ عملیات لغو شد")
                 continue
 
             quality = int(data)
             video_data = cache.get(chat_id)
-
             if not video_data:
                 continue
 
