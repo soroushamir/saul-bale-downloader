@@ -1,47 +1,17 @@
 import os
 import time
-import random
 import requests
 import yt_dlp
 
-# ================== تنظیمات ==================
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 BASE_URL = f"https://tapi.bale.ai/bot{BOT_TOKEN}"
 
 session = requests.Session()
 offset = None
 
-# ذخیره اطلاعات هر چت
 cache = {}
 
-# ================== دیالوگ‌های ساول ==================
-SAUL_MESSAGES = {
-    "received": [
-        "😎 اوهو! یه پرونده تازه افتاد دست ساول",
-        "📂 لینک اومد، ساول وارد می‌شود...",
-    ],
-    "quality": [
-        "📺 خب موکل من! کیفیتو بگو دادگاه شروع شه",
-        "⚖️ دادگاه کیفیت‌ها تشکیل شد، انتخاب کن!",
-    ],
-    "downloading": [
-        "📞 بهتره بزنگی با ساول… دارم کاراتو ردیف می‌کنم",
-        "😏 ساول داره سیستم رو دور می‌زنه، صبور باش",
-    ],
-    "done": [
-        "🎬 پرونده با موفقیت بسته شد! نوش جون 😎",
-        "💼 ساول گفت انجام شد!",
-    ],
-    "error": [
-        "🤨 این لینک حتی تو آلبوکرکی هم اعتبار نداره",
-        "🚫 ساولم نتونست اینو نجات بده!",
-    ]
-}
-
-def saul_say(cat):
-    return random.choice(SAUL_MESSAGES[cat])
-
-# ================== توابع بله ==================
+# ------------------ Bale API ------------------
 def get_updates(offset=None):
     params = {"timeout": 20}
     if offset:
@@ -54,10 +24,12 @@ def send_message(chat_id, text, reply_markup=None):
         data["reply_markup"] = reply_markup
     session.post(f"{BASE_URL}/sendMessage", json=data)
 
-def send_photo(chat_id, photo_url, caption=None, reply_markup=None):
-    data = {"chat_id": chat_id, "photo": photo_url}
-    if caption:
-        data["caption"] = caption
+def send_photo(chat_id, photo, caption, reply_markup=None):
+    data = {
+        "chat_id": chat_id,
+        "photo": photo,
+        "caption": caption
+    }
     if reply_markup:
         data["reply_markup"] = reply_markup
     session.post(f"{BASE_URL}/sendPhoto", json=data)
@@ -70,107 +42,124 @@ def send_video(chat_id, path):
             files={"video": v}
         )
 
-# ================== yt-dlp ==================
+# ------------------ yt-dlp ------------------
 def extract_info(url):
-    ydl_opts = {
-        "quiet": True,
-        "skip_download": True,
-    }
-    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+    with yt_dlp.YoutubeDL({"quiet": True}) as ydl:
         return ydl.extract_info(url, download=False)
 
 def available_qualities(info):
-    wanted = {360, 480, 720, 1080}
+    valid = [360, 480, 720, 1080]
     found = set()
     for f in info.get("formats", []):
         h = f.get("height")
-        if h in wanted:
+        if h in valid:
             found.add(h)
-    return sorted(found)
+    return [q for q in valid if q in found]
 
-def download_video(url, quality):
+def download_video(url, quality, chat_id):
+    def hook(d):
+        if d["status"] == "downloading":
+            total = d.get("total_bytes") or d.get("total_bytes_estimate")
+            if total:
+                percent = int(d.get("downloaded_bytes", 0) * 100 / total)
+                if percent in (10, 30, 50, 70, 90):
+                    send_message(chat_id, f"⬇️ دانلود: {percent}%")
+
+        if d["status"] == "finished":
+            send_message(chat_id, "✅ دانلود کامل شد، در حال ارسال…")
+
     ydl_opts = {
         "format": f"bestvideo[height<={quality}][ext=mp4]+bestaudio[ext=m4a]/mp4",
         "outtmpl": "video.mp4",
         "merge_output_format": "mp4",
-        "quiet": True
+        "quiet": True,
+        "progress_hooks": [hook]
     }
+
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         ydl.download([url])
+
     return "video.mp4"
 
-# ================== حلقه اصلی ==================
+# ------------------ Main Loop ------------------
 while True:
     updates = get_updates(offset)
 
     for upd in updates.get("result", []):
         offset = upd["update_id"] + 1
 
-        # ---------- پیام متنی ----------
+        # -------- Message --------
         if "message" in upd and "text" in upd["message"]:
-            msg = upd["message"]
-            chat_id = msg["chat"]["id"]
-            text = msg["text"]
+            chat_id = upd["message"]["chat"]["id"]
+            text = upd["message"]["text"]
 
-            if any(x in text for x in ["youtube.com", "youtu.be", "instagram.com"]):
-                send_message(chat_id, saul_say("received"))
+            if any(x in text for x in ["youtube.com", "youtu.be", "instagram.com", "tiktok.com"]):
+                send_message(chat_id, "🔍 در حال بررسی لینک…")
 
                 try:
                     info = extract_info(text)
                     qualities = available_qualities(info)
 
                     if not qualities:
-                        raise Exception("No qualities found")
+                        raise Exception("No valid quality")
 
                     cache[chat_id] = {
                         "url": text,
-                        "title": info.get("title", ""),
+                        "title": info.get("title", "ویدیو"),
+                        "duration": info.get("duration", 0)
                     }
 
+                    mins = cache[chat_id]["duration"] // 60
+                    secs = cache[chat_id]["duration"] % 60
+
+                    caption = (
+                        f"🎬 {cache[chat_id]['title']}\n"
+                        f"⏱ {mins:02}:{secs:02}\n\n"
+                        "کیفیت موردنظر رو انتخاب کن 👇"
+                    )
+
                     buttons = [
-                        [{"text": f"{q}p", "callback_data": str(q)}]
-                        for q in qualities
+                        [{"text": f"{q}p", "callback_data": str(q)} for q in qualities],
+                        [{"text": "❌ لغو", "callback_data": "cancel"}]
                     ]
 
-                    thumb = info.get("thumbnail")
-
-                    if thumb:
-                        send_photo(
-                            chat_id,
-                            thumb,
-                            caption=saul_say("quality"),
-                            reply_markup={"inline_keyboard": buttons}
-                        )
-                    else:
-                        send_message(
-                            chat_id,
-                            saul_say("quality"),
-                            reply_markup={"inline_keyboard": buttons}
-                        )
+                    send_photo(
+                        chat_id,
+                        info.get("thumbnail"),
+                        caption,
+                        {"inline_keyboard": buttons}
+                    )
 
                 except Exception as e:
                     print("ERROR:", e)
-                    send_message(chat_id, saul_say("error"))
+                    send_message(chat_id, "❌ خطا در پردازش لینک")
 
-        # ---------- انتخاب کیفیت ----------
+        # -------- Callback --------
         if "callback_query" in upd:
             cq = upd["callback_query"]
             chat_id = cq["message"]["chat"]["id"]
-            quality = int(cq["data"])
+            data = cq["data"]
 
-            data = cache.get(chat_id)
-            if not data:
+            if data == "cancel":
+                send_message(chat_id, "❌ عملیات لغو شد")
+                cache.pop(chat_id, None)
                 continue
 
-            send_message(chat_id, saul_say("downloading"))
+            quality = int(data)
+            video_data = cache.get(chat_id)
+
+            if not video_data:
+                continue
+
+            send_message(chat_id, f"⬇️ دانلود با کیفیت {quality}p شروع شد")
 
             try:
-                video = download_video(data["url"], quality)
+                video = download_video(video_data["url"], quality, chat_id)
                 send_video(chat_id, video)
                 os.remove(video)
-                send_message(chat_id, saul_say("done"))
+                send_message(chat_id, "🎉 دانلود کامل شد")
             except Exception as e:
                 print("DOWNLOAD ERROR:", e)
-                send_message(chat_id, saul_say("error"))
+                send_message(chat_id, "❌ خطا در دانلود")
 
     time.sleep(1)
