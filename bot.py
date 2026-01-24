@@ -91,6 +91,7 @@ while True:
                 send_message(chat_id, saul_say("received"))
                 try:
                     qualities = get_formats(text)
+                    print("QUALITIES:", qualities)
                     user_links[chat_id] = text
 
                     buttons = [
